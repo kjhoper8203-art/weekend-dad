@@ -1,0 +1,48 @@
+# .github/workflows/weekend.yml
+# 저장소 안에서 반드시 .github/workflows/ 폴더에 두세요.
+name: weekend
+
+on:
+  schedule:
+    - cron: "0 0 * * 3" # 매주 수요일 09:00 KST (00:00 UTC)
+  workflow_dispatch: {} # Actions 탭에서 수동 실행(테스트)용
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Generate page & send Telegram
+        run: node generate.mjs
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # ▼▼ 여기 3줄은 정현님 환경에 맞게 수정하세요 ▼▼
+          SITE_URL: "https://내깃허브아이디.github.io/weekend-dad/"
+          KIDS_AGES: "5, 7"
+          LOCATION: "서울 마포구"
+          MUSEUM_RATIO: "60"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./public
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
