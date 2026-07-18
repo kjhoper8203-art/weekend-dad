@@ -37,7 +37,7 @@ jobs:
           # ▼▼ 여기 3줄은 정현님 환경에 맞게 수정하세요 ▼▼
           SITE_URL: "https://kjhoper8203-art.github.io/weekend-dad/"
           KIDS_AGES: "4, 6"
-          LOCATION: "경기도 안양시"
+          LOCATION: "안양"
           MUSEUM_RATIO: "60"
 
       - uses: actions/upload-pages-artifact@v3
