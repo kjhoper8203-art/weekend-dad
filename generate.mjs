@@ -1,4 +1,4 @@
-// generate.mjs
+// generate.mjs  (완성본 — 이 파일 전체를 그대로 사용하세요)
 // 매주 수요일 GitHub Actions가 실행합니다.
 // 1) 이번 주말 날씨(무료 Open-Meteo, 키 불필요)
 // 2) Claude로 아이 나이·취향 맞춤 추천
@@ -11,7 +11,7 @@ import { writeFile, mkdir } from "node:fs/promises";
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const SITE_URL = process.env.SITE_URL || ""; // 예: https://내아이디.github.io/weekend-dad/
+const SITE_URL = process.env.SITE_URL || "";
 
 // ── 가족 설정 ──
 const AGES = process.env.KIDS_AGES || "5, 7";
@@ -55,7 +55,7 @@ async function getWeather() {
     `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(LOCATION)}&count=1&language=ko`
   ).then((r) => r.json());
   const spot = geo?.results?.[0];
-  if (!spot) throw new Error(`위치를 못 찾음: ${LOCATION}`);
+  if (!spot) throw new Error(`위치를 못 찾음: ${LOCATION} (지역명을 간단히 또는 영어로 바꿔보세요)`);
   const f = await fetch(
     `https://api.open-meteo.com/v1/forecast?latitude=${spot.latitude}&longitude=${spot.longitude}` +
       `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
@@ -93,6 +93,7 @@ async function getPlaces(weather) {
 - 사람이 아주 붐비는 곳은 피하고 한적한 곳 우선
 - 위 날씨 반영(비/폭염인 날은 실내 위주)
 
+각 장소의 desc, why는 한 문장으로 짧게 쓰세요.
 아래 JSON 객체 하나만 출력(코드블록·설명 없이):
 {
  "note":"아빠에게 건네는 따뜻한 제안 1~2문장",
@@ -110,7 +111,6 @@ crowd는 "낮음/보통/높음", bestDay는 "토/일/주말내내".`;
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      // 모델명은 docs.claude.com 에서 최신값 확인 가능
       model: "claude-sonnet-5",
       max_tokens: 4000,
       messages: [{ role: "user", content: prompt }],
@@ -118,18 +118,18 @@ crowd는 "낮음/보통/높음", bestDay는 "토/일/주말내내".`;
   });
   const data = await res.json();
   if (!res.ok) throw new Error("Anthropic 오류: " + JSON.stringify(data));
-const text = data.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+  const text = data.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
   const s = text.indexOf("{");
-  let e = text.lastIndexOf("}");
-  let slice = text.slice(s, e + 1);
+  const e = text.lastIndexOf("}");
+  const slice = text.slice(s, e + 1);
   try {
     return JSON.parse(slice);
   } catch {
-    // 답이 잘렸을 때: 마지막으로 온전한 항목까지만 살려서 복구
-    const lastItem = slice.lastIndexOf("}", slice.lastIndexOf("}") - 1);
-    let repaired = slice.slice(0, lastItem + 1) + "]}";
-    return JSON.parse(repaired);
+    // 답이 잘렸을 때: 마지막 온전한 항목까지만 살려서 복구
+    const cut = slice.lastIndexOf("}", slice.lastIndexOf("}") - 1);
+    return JSON.parse(slice.slice(0, cut + 1) + "]}");
   }
+}
 
 // ── 스타일 매핑 ──
 function typeMeta(t = "") {
@@ -144,7 +144,8 @@ function crowdMeta(l = "") {
   if (/높/.test(l)) return { c: "#C1503F", bg: "#F7E3DF", label: "붐빔" };
   return { c: "#DD8A2E", bg: "#FBEAD1", label: "보통" };
 }
-const esc = (s = "") => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const esc = (s = "") =>
+  String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 // ── HTML 페이지 렌더 ──
 function renderPage({ weather, note, places, satLabel, sunLabel, updated }) {
@@ -180,7 +181,6 @@ function renderPage({ weather, note, places, satLabel, sunLabel, updated }) {
   return `<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>주말 우수 남편 봇</title>
-<link rel="preconnect" href="https://cdn.jsdelivr.net">
 <style>
 @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable.min.css');
 *{box-sizing:border-box}
@@ -228,7 +228,7 @@ body.hidecrowd .place[data-crowd="높음"]{display:none}
   ${note ? `<div class="note"><span class="badge">우수 남편 봇</span><p>${esc(note)}</p></div>` : ""}
   <div class="weather">${wCard("토", satLabel, weather.sat)}${wCard("일", sunLabel, weather.sun)}</div>
   <div class="bar">
-    <span class="cnt">추천 ${places.length}곳</span>
+    <span class="cnt">추천 ${(places || []).length}곳</span>
     <label class="toggle"><input type="checkbox" id="hc">붐비는 곳 숨기기</label>
   </div>
   <div class="places">${cards}</div>
@@ -267,7 +267,7 @@ try {
   const msg =
     `☀️ 이번 주말 나들이 추천 (${satLabel}~${sunLabel})\n\n` +
     `토: ${w(weather.sat)}\n일: ${w(weather.sun)}\n\n` +
-    `아이들 데려갈 곳 ${places.length}곳 골라놨어요 👇\n${SITE_URL}`;
+    `아이들 데려갈 곳 ${(places || []).length}곳 골라놨어요 👇\n${SITE_URL}`;
   await sendTelegram(msg);
 
   console.log("✅ 페이지 생성 + 텔레그램 발송 완료");
