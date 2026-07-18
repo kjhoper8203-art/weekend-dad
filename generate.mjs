@@ -112,16 +112,24 @@ crowd는 "낮음/보통/높음", bestDay는 "토/일/주말내내".`;
     body: JSON.stringify({
       // 모델명은 docs.claude.com 에서 최신값 확인 가능
       model: "claude-sonnet-5",
-      max_tokens: 1500,
+      max_tokens: 4000,
       messages: [{ role: "user", content: prompt }],
     }),
   });
   const data = await res.json();
   if (!res.ok) throw new Error("Anthropic 오류: " + JSON.stringify(data));
-  const text = data.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
-  const s = text.indexOf("{"), e = text.lastIndexOf("}");
-  return JSON.parse(text.slice(s, e + 1));
-}
+const text = data.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+  const s = text.indexOf("{");
+  let e = text.lastIndexOf("}");
+  let slice = text.slice(s, e + 1);
+  try {
+    return JSON.parse(slice);
+  } catch {
+    // 답이 잘렸을 때: 마지막으로 온전한 항목까지만 살려서 복구
+    const lastItem = slice.lastIndexOf("}", slice.lastIndexOf("}") - 1);
+    let repaired = slice.slice(0, lastItem + 1) + "]}";
+    return JSON.parse(repaired);
+  }
 
 // ── 스타일 매핑 ──
 function typeMeta(t = "") {
