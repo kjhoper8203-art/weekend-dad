@@ -1,8 +1,8 @@
-// generate.mjs  (v2 — 후보수집·평가·제외 기준 반영판)
+// generate.mjs  (v3 — JSON 추출 안정화판)
 // 매주 수요일 GitHub Actions가 실행합니다.
 //  1) 이번 주말 날씨 (Open-Meteo, 무료·키 불필요)
-//  2) Claude + 웹검색으로 후보 수집 → 평가 → 제외 → 최종 선별
-//  3) 상세 정보가 담긴 페이지(public/index.html) 생성
+//  2) Claude + 웹검색으로 후보수집 → 평가 → 제외 → 최종선별
+//  3) 상세 페이지(public/index.html) 생성
 //  4) 텔레그램으로 링크 발송
 // Node 20+ (설치 패키지 없음)
 
@@ -78,12 +78,60 @@ async function getWeather() {
   return { sat: pick(satISO), sun: pick(sunISO) };
 }
 
+// ── 답변에서 JSON만 안전하게 추출 (검색 멘트 섞임 / 중간 잘림 대응) ──
+function extractJson(text) {
+  const clean = text.replace(/```json/gi, "").replace(/```/g, "");
+
+  // 1) 균형 잡힌 { ... } 후보를 모두 찾아 파싱 (places 포함된 것 우선)
+  const candidates = [];
+  for (let i = 0; i < clean.length; i++) {
+    if (clean[i] !== "{") continue;
+    let depth = 0, inStr = false, esc = false;
+    for (let j = i; j < clean.length; j++) {
+      const ch = clean[j];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === "\\") esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') inStr = true;
+      else if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) { candidates.push(clean.slice(i, j + 1)); i = j; break; }
+      }
+    }
+  }
+  for (const c of candidates) {
+    if (!c.includes('"places"')) continue;
+    try { return JSON.parse(c); } catch {}
+  }
+
+  // 2) 잘린 경우: 마지막 온전한 항목까지만 살려 복구
+  const start = clean.lastIndexOf('{"note"') !== -1 ? clean.lastIndexOf('{"note"') : clean.indexOf("{");
+  if (start === -1) throw new Error("추천 결과에서 JSON을 찾지 못했습니다.");
+  const body = clean.slice(start);
+  const suffixes = ["", "}", "]}", "}]}", '"}]}', '""}]}'];
+  for (let k = body.length; k > 0; k--) {
+    if (body[k - 1] !== "}") continue;
+    const head = body.slice(0, k);
+    for (const s of suffixes) {
+      try {
+        const o = JSON.parse(head + s);
+        if (o && Array.isArray(o.places)) return o;
+      } catch {}
+    }
+  }
+  throw new Error("추천 결과 형식이 올바르지 않습니다.");
+}
+
 // ── Claude 추천 (후보수집 → 평가 → 제외 → 최종선별) ──
 async function getPlaces(weather) {
   const { satLabel, sunLabel } = weekendDates();
   const wLine = (w) => (w ? `${w.condition} ${w.high}°/${w.low}°, 강수확률 ${w.rain}%` : "정보 없음");
 
-  const prompt = `당신은 가족 나들이 플래너입니다. 아래 절차를 반드시 순서대로 수행하세요.
+  const prompt = `당신은 가족 나들이 플래너입니다. 아래 절차를 순서대로 수행하세요.
 
 # 기본 조건
 - 기준 위치(집): ${LOCATION}
@@ -95,53 +143,24 @@ async function getPlaces(weather) {
 - 성향: 박물관·전시·체험 선호(약 ${RATIO}%), 나머지는 자연·산책·실내놀이 등으로 배분. 사람이 많고 복잡한 곳 기피.
 
 # 1단계) 후보 수집
-web_search를 사용해 다음 범주에서 후보를 폭넓게 수집하세요.
+web_search로 다음 범주에서 후보를 폭넓게 수집하세요.
 대표 관광지 / 아이와 가기 좋은 곳 / 자연·산책 / 실내·우천 대체 / 맛집 / 카페 / 특별 체험 / 사진 명소
 
 # 2단계) 후보 평가
-각 후보를 다음 기준으로 평가하세요. 운영시간·휴무일·예약 필요 여부·최근 리뷰 경향은 반드시 web_search로 확인하고, 확인이 안 되면 그 사실을 명시하세요.
-목적 적합성 / 집과의 거리·이동시간 / 운영시간 / 휴무일 / 예약 필요 / 비용 / 아이 동반 편의성(유모차·엘리베이터·계단) / 주차 / 화장실 / 대기시간 / 최근 리뷰 / 사진 만족도 / 날씨 영향 / 대체 가능성
+다음 기준으로 평가하세요. 운영시간·휴무일·예약 여부·최근 리뷰는 web_search로 확인하고, 확인이 안 되면 그 사실을 명시하세요.
+목적 적합성 / 거리·이동시간 / 운영시간 / 휴무일 / 예약 / 비용 / 아이 동반 편의성(유모차·엘리베이터·계단) / 주차 / 화장실 / 대기시간 / 최근 리뷰 / 사진 만족도 / 날씨 영향 / 대체 가능성
 
 # 3단계) 제외
-아래는 원칙적으로 제외하세요(부득이 포함 시 warning 필드에 경고를 적을 것).
-- 이동시간 대비 만족도가 낮은 곳
-- 과도하게 붐비거나 웨이팅이 긴 곳
-- ${AGES}세 아이가 힘들 가능성이 높은 곳
-- 운영 여부가 불확실한 곳
-- 이미 비슷한 유형이 목록에 포함된 경우(중복 배제)
-- 동선에서 크게 벗어나는 곳
-- 안전상 주의가 필요한 곳
+아래는 원칙적으로 제외하세요(부득이 포함 시 warning에 경고를 적을 것).
+이동시간 대비 만족도가 낮은 곳 / 과도하게 붐비거나 웨이팅이 긴 곳 / ${AGES}세 아이가 힘든 곳 / 운영 여부가 불확실한 곳 / 이미 비슷한 유형이 포함된 경우 / 동선에서 크게 벗어난 곳 / 안전상 주의가 필요한 곳
 
 # 4단계) 최종 선별
-최종 5곳만 남기세요. 각 장소에 추천 이유, 탈락한 대안과의 차이, 체류시간, 이동시간, 비용, 예약 필요 여부, 날씨 변수, 아이 동반 팁을 반드시 붙이세요.
+최종 5곳만 남기고, 각 장소에 추천 이유·대안과의 차이·체류시간·이동시간·비용·예약 여부·날씨 변수·아이 동반 팁을 붙이세요.
 
-# 출력 형식
-아래 JSON 객체 하나만 출력하세요. 코드블록·설명·인사말 없이 JSON만.
-각 문자열은 한 문장으로 간결하게 쓰세요.
-{
- "note":"아빠에게 건네는 이번 주말 제안 1~2문장",
- "excluded":"검토했으나 제외한 곳과 그 이유를 1~2문장으로",
- "places":[
-  {
-   "name":"장소명","type":"박물관","area":"지역",
-   "desc":"한 줄 소개",
-   "why":"추천 이유 한 문장",
-   "vsAlt":"비슷한 대안 대비 이곳이 나은 점 한 문장",
-   "stay":"예상 체류시간 (예: 2시간)",
-   "travel":"집에서 이동시간 (예: 차 25분)",
-   "cost":"비용 (예: 어른 4천원·어린이 무료 / 무료)",
-   "booking":"예약 필요 여부 (예: 불필요 / 온라인 사전예약 필수)",
-   "hours":"운영시간·휴무일 (예: 09:30-18:00, 월요일 휴무)",
-   "weatherNote":"날씨 변수 한 문장",
-   "kidTip":"아이 동반 팁 한 문장 (유모차·주차·화장실·대기 등)",
-   "ageFit":"추천 연령",
-   "indoor":true,
-   "crowd":"낮음",
-   "bestDay":"토",
-   "warning":"주의사항이 있으면 한 문장, 없으면 빈 문자열"
-  }
- ]
-}
+# 출력 형식 (매우 중요)
+마지막 답변은 아래 JSON 객체 하나만 출력하세요. 앞뒤에 어떤 설명도 붙이지 마세요.
+각 문자열은 한 문장으로 간결하게(40자 이내) 쓰세요.
+{"note":"아빠에게 건네는 제안 1~2문장","excluded":"검토했으나 제외한 곳과 이유 1~2문장","places":[{"name":"장소명","type":"박물관","area":"지역","desc":"한 줄 소개","why":"추천 이유","vsAlt":"비슷한 대안 대비 나은 점","stay":"예상 체류시간","travel":"집에서 이동시간","cost":"비용","booking":"예약 필요 여부","hours":"운영시간·휴무일","weatherNote":"날씨 변수","kidTip":"아이 동반 팁","ageFit":"추천 연령","indoor":true,"crowd":"낮음","bestDay":"토","warning":""}]}
 crowd는 "낮음/보통/높음", bestDay는 "토/일/주말내내".`;
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -167,16 +186,11 @@ crowd는 "낮음/보통/높음", bestDay는 "토/일/주말내내".`;
     .map((b) => b.text)
     .join("\n");
 
-  const s = text.indexOf("{");
-  const e = text.lastIndexOf("}");
-  const slice = text.slice(s, e + 1);
-  try {
-    return JSON.parse(slice);
-  } catch {
-    // 답이 잘렸을 때: 마지막 온전한 항목까지만 살려 복구
-    const cut = slice.lastIndexOf("}", slice.lastIndexOf("}") - 1);
-    return JSON.parse(slice.slice(0, cut + 1) + "]}");
+  const result = extractJson(text);
+  if (!Array.isArray(result.places) || result.places.length === 0) {
+    throw new Error("추천 장소가 비어 있습니다. 다시 실행해보세요.");
   }
+  return result;
 }
 
 // ── 스타일 매핑 ──
@@ -334,9 +348,9 @@ try {
   await writeFile("public/index.html", html, "utf-8");
 
   const w = (x) => (x ? `${x.emoji} ${x.condition} ${x.high}°/${x.low}°` : "-");
-  const top = (places || [])
+  const top = places
     .slice(0, 3)
-    .map((p, i) => `${i + 1}. ${p.name} (${p.travel || ""})`)
+    .map((p, i) => `${i + 1}. ${p.name}${p.travel ? ` (${p.travel})` : ""}`)
     .join("\n");
   const msg =
     `☀️ 이번 주말 나들이 추천 (${satLabel}~${sunLabel})\n\n` +
@@ -345,7 +359,7 @@ try {
     `체류시간·비용·예약·아이팁까지 정리해놨어요 👇\n${SITE_URL}`;
   await sendTelegram(msg);
 
-  console.log("✅ 페이지 생성 + 텔레그램 발송 완료");
+  console.log(`✅ 완료 — 추천 ${places.length}곳, 텔레그램 발송됨`);
 } catch (e) {
   console.error("❌ 실패:", e.message);
   process.exit(1);
