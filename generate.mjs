@@ -3,7 +3,7 @@
 //  2단계: 조사 내용을 JSON으로 변환 (검색 없음 → 형식 안정)
 //  실패 시 자동 재시도, 그래도 실패하면 원인 진단 로그 출력
 
-import { writeFile, mkdir } from "node:fs/promises";
+import { writeFile, readFile, mkdir } from "node:fs/promises";
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -18,6 +18,8 @@ const RATIO = process.env.MUSEUM_RATIO || "60";
 const MAX_TRAVEL = process.env.MAX_TRAVEL || "60";
 const KEEP_WEEKS = Number(process.env.KEEP_WEEKS || 8);
 const MODEL = process.env.MODEL || "claude-sonnet-5";
+const MODE = process.argv[2] || "generate";                 // generate | send
+const MSG_FILE = "telegram-message.txt";
 const PLACE_COUNT = Number(process.env.PLACE_COUNT || 5);   // 목표 추천 수
 const MIN_PLACES = Number(process.env.MIN_PLACES || 4);     // 이보다 적으면 재시도
 
@@ -295,6 +297,7 @@ function renderPage({ weather, note, excluded, places, satLabel, sunLabel, updat
 
   return `<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="cache-control" content="no-cache">
 <title>${esc(BOT_NAME)}</title>
 <style>
 @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable.min.css');
@@ -378,47 +381,62 @@ async function sendTelegram(text) {
 }
 
 // ── 실행 ──
-try {
-  const { satLabel, sunLabel } = weekendDates();
+// send 모드: 페이지 배포가 끝난 뒤 저장해둔 메시지를 발송
+if (MODE === "send") {
+  try {
+    const msg = await readFile(MSG_FILE, "utf-8");
+    await sendTelegram(msg);
+    console.log("✅ 텔레그램 발송 완료");
+  } catch (e) {
+    console.error("❌ 발송 실패:", e.message);
+    process.exit(1);
+  }
+} else {
+  try {
+    const { satLabel, sunLabel } = weekendDates();
 
-  const prevHistory = await loadHistory();
-  const avoid = recentNames(prevHistory);
-  console.log(`ℹ️ 최근 ${KEEP_WEEKS}주 제외 대상 ${avoid.length}곳`);
+    const prevHistory = await loadHistory();
+    const avoid = recentNames(prevHistory);
+    console.log(`ℹ️ 최근 ${KEEP_WEEKS}주 제외 대상 ${avoid.length}곳`);
 
-  const weather = await getWeather();
-  console.log("ℹ️ 날씨 조회 완료");
+    const weather = await getWeather();
+    console.log("ℹ️ 날씨 조회 완료");
 
-  const notes = await research(weather, avoid);
-  console.log(`ℹ️ 1단계 조사 완료 (${notes.length}자)`);
+    const notes = await research(weather, avoid);
+    console.log(`ℹ️ 1단계 조사 완료 (${notes.length}자)`);
 
-  const result = await toJson(notes, weather, avoid);
-  const parsed = (result.places || []).length;
-  const places = (result.places || []).filter((p) => p && p.name && !avoid.includes(p.name));
-  if (parsed !== places.length) console.log(`ℹ️ 최근 방문지와 겹쳐 ${parsed - places.length}곳 제외`);
-  if (!places.length) throw new Error("최종 추천이 비어 있습니다. 다시 실행해보세요.");
-  console.log(`ℹ️ 2단계 정리 완료 (${places.length}곳)`);
+    const result = await toJson(notes, weather, avoid);
+    const parsed = (result.places || []).length;
+    const places = (result.places || []).filter((p) => p && p.name && !avoid.includes(p.name));
+    if (parsed !== places.length) console.log(`ℹ️ 최근 방문지와 겹쳐 ${parsed - places.length}곳 제외`);
+    if (!places.length) throw new Error("최종 추천이 비어 있습니다. 다시 실행해보세요.");
+    console.log(`ℹ️ 2단계 정리 완료 (${places.length}곳)`);
 
-  const updated = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
-  const history = mergeHistory(prevHistory, { date: updated, places: places.map((p) => p.name) });
+    const updated = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+    const history = mergeHistory(prevHistory, { date: updated, places: places.map((p) => p.name) });
 
-  const html = renderPage({
-    weather, note: result.note, excluded: result.excluded,
-    places, satLabel, sunLabel, updated, history,
-  });
-  await mkdir("public", { recursive: true });
-  await writeFile("public/index.html", html, "utf-8");
-  await writeFile("public/history.json", JSON.stringify(history, null, 2), "utf-8");
+    const html = renderPage({
+      weather, note: result.note, excluded: result.excluded,
+      places, satLabel, sunLabel, updated, history,
+    });
+    await mkdir("public", { recursive: true });
+    await writeFile("public/index.html", html, "utf-8");
+    await writeFile("public/history.json", JSON.stringify(history, null, 2), "utf-8");
 
-  const w = (x) => (x ? `${x.emoji} ${x.condition} ${x.high}°/${x.low}°` : "-");
-  const top = places.slice(0, 3).map((p, i) => `${i + 1}. ${p.name}${p.travel ? ` (${p.travel})` : ""}`).join("\n");
-  await sendTelegram(
-    `☀️ 이번 주말 나들이 추천 (${satLabel}~${sunLabel})\n\n` +
-    `토: ${w(weather.sat)}\n일: ${w(weather.sun)}\n\n${top}\n\n` +
-    `체류시간·비용·예약·아이팁까지 정리해놨어요 👇\n${SITE_URL}`
-  );
+    // 링크에 매번 다른 값을 붙여 옛 화면이 뜨는 것을 방지
+    const link = `${SITE_URL}?v=${Date.now()}`;
+    const w = (x) => (x ? `${x.emoji} ${x.condition} ${x.high}°/${x.low}°` : "-");
+    const list = places.map((p, i) => `${i + 1}. ${p.name}${p.travel ? ` (${p.travel})` : ""}`).join("\n");
+    const msg =
+      `☀️ 이번 주말 나들이 추천 (${satLabel}~${sunLabel})\n\n` +
+      `토: ${w(weather.sat)}\n일: ${w(weather.sun)}\n\n${list}\n\n` +
+      `체류시간·비용·예약·아이팁까지 정리해놨어요 👇\n${link}`;
+    await writeFile(MSG_FILE, msg, "utf-8");
 
-  console.log(`✅ 완료 — 추천 ${places.length}곳, 이력 ${history.weeks.length}주 보관`);
-} catch (e) {
-  console.error("❌ 실패:", e.message);
-  process.exit(1);
+    console.log(`✅ 페이지 생성 완료 — 추천 ${places.length}곳, 이력 ${history.weeks.length}주 보관`);
+    console.log("   (텔레그램은 배포 완료 후 발송됩니다)");
+  } catch (e) {
+    console.error("❌ 실패:", e.message);
+    process.exit(1);
+  }
 }
