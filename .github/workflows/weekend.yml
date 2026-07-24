@@ -37,6 +37,8 @@ jobs:
           # ▼▼ 여기 3줄은 정현님 환경에 맞게 수정하세요 ▼▼
           SITE_URL: "https://kjhoper8203-art.github.io/weekend-dad/"
           KIDS_AGES: "4, 6"
+          BOT_NAME: "주말 작전참모"
+          KEEP_WEEKS: "8"
           MAX_TRAVEL: "60"
           LOCATION: "안양"
           MUSEUM_RATIO: "50"
