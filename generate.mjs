@@ -1,10 +1,10 @@
-// generate.mjs  (완성본 — 이 파일 전체를 그대로 사용하세요)
+// generate.mjs  (v2 — 후보수집·평가·제외 기준 반영판)
 // 매주 수요일 GitHub Actions가 실행합니다.
-// 1) 이번 주말 날씨(무료 Open-Meteo, 키 불필요)
-// 2) Claude로 아이 나이·취향 맞춤 추천
-// 3) 예쁜 static 페이지(public/index.html) 생성
-// 4) 텔레그램으로 그 페이지 링크 발송
-// Node 20+ (별도 설치 패키지 없음)
+//  1) 이번 주말 날씨 (Open-Meteo, 무료·키 불필요)
+//  2) Claude + 웹검색으로 후보 수집 → 평가 → 제외 → 최종 선별
+//  3) 상세 정보가 담긴 페이지(public/index.html) 생성
+//  4) 텔레그램으로 링크 발송
+// Node 20+ (설치 패키지 없음)
 
 import { writeFile, mkdir } from "node:fs/promises";
 
@@ -15,8 +15,9 @@ const SITE_URL = process.env.SITE_URL || "";
 
 // ── 가족 설정 ──
 const AGES = process.env.KIDS_AGES || "5, 7";
-const LOCATION = process.env.LOCATION || "서울 마포구";
+const LOCATION = process.env.LOCATION || "안양";
 const RATIO = process.env.MUSEUM_RATIO || "60";
+const MAX_TRAVEL = process.env.MAX_TRAVEL || "60"; // 편도 최대 이동시간(분)
 
 // ── 이번 주말(다가오는 토/일) 날짜 (KST) ──
 function weekendDates() {
@@ -48,7 +49,7 @@ function wmo(code) {
   return m[code] || ["🌤️", "-"];
 }
 
-// ── 날씨 가져오기 (Open-Meteo, 무료·키 불필요) ──
+// ── 날씨 (Open-Meteo) ──
 async function getWeather() {
   const { satISO, sunISO } = weekendDates();
   const geo = await fetch(
@@ -77,28 +78,68 @@ async function getWeather() {
   return { sat: pick(satISO), sun: pick(sunISO) };
 }
 
-// ── Claude로 추천 받기 ──
+// ── Claude 추천 (후보수집 → 평가 → 제외 → 최종선별) ──
 async function getPlaces(weather) {
   const { satLabel, sunLabel } = weekendDates();
-  const wLine = (w) => (w ? `${w.condition} ${w.high}°/${w.low}°, 강수 ${w.rain}%` : "정보 없음");
-  const prompt = `당신은 주말 가족 나들이 추천 전문가입니다.
+  const wLine = (w) => (w ? `${w.condition} ${w.high}°/${w.low}°, 강수확률 ${w.rain}%` : "정보 없음");
 
-이번 주말 "${LOCATION}" 날씨:
-- 토(${satLabel}): ${wLine(weather.sat)}
-- 일(${sunLabel}): ${wLine(weather.sun)}
+  const prompt = `당신은 가족 나들이 플래너입니다. 아래 절차를 반드시 순서대로 수행하세요.
 
-조건에 맞는 장소 5곳을 추천하세요.
+# 기본 조건
+- 기준 위치(집): ${LOCATION}
 - 아이 나이: ${AGES}세
-- 박물관·전시·체험을 약 ${RATIO}% 비중으로, 나머지는 공원·자연·실내놀이로 섞기
-- 사람이 아주 붐비는 곳은 피하고 한적한 곳 우선
-- 위 날씨 반영(비/폭염인 날은 실내 위주)
+- 편도 이동시간 상한: ${MAX_TRAVEL}분
+- 이번 주말 날씨
+  · 토(${satLabel}): ${wLine(weather.sat)}
+  · 일(${sunLabel}): ${wLine(weather.sun)}
+- 성향: 박물관·전시·체험 선호(약 ${RATIO}%), 나머지는 자연·산책·실내놀이 등으로 배분. 사람이 많고 복잡한 곳 기피.
 
-각 장소의 desc, why는 한 문장으로 짧게 쓰세요.
-아래 JSON 객체 하나만 출력(코드블록·설명 없이):
+# 1단계) 후보 수집
+web_search를 사용해 다음 범주에서 후보를 폭넓게 수집하세요.
+대표 관광지 / 아이와 가기 좋은 곳 / 자연·산책 / 실내·우천 대체 / 맛집 / 카페 / 특별 체험 / 사진 명소
+
+# 2단계) 후보 평가
+각 후보를 다음 기준으로 평가하세요. 운영시간·휴무일·예약 필요 여부·최근 리뷰 경향은 반드시 web_search로 확인하고, 확인이 안 되면 그 사실을 명시하세요.
+목적 적합성 / 집과의 거리·이동시간 / 운영시간 / 휴무일 / 예약 필요 / 비용 / 아이 동반 편의성(유모차·엘리베이터·계단) / 주차 / 화장실 / 대기시간 / 최근 리뷰 / 사진 만족도 / 날씨 영향 / 대체 가능성
+
+# 3단계) 제외
+아래는 원칙적으로 제외하세요(부득이 포함 시 warning 필드에 경고를 적을 것).
+- 이동시간 대비 만족도가 낮은 곳
+- 과도하게 붐비거나 웨이팅이 긴 곳
+- ${AGES}세 아이가 힘들 가능성이 높은 곳
+- 운영 여부가 불확실한 곳
+- 이미 비슷한 유형이 목록에 포함된 경우(중복 배제)
+- 동선에서 크게 벗어나는 곳
+- 안전상 주의가 필요한 곳
+
+# 4단계) 최종 선별
+최종 5곳만 남기세요. 각 장소에 추천 이유, 탈락한 대안과의 차이, 체류시간, 이동시간, 비용, 예약 필요 여부, 날씨 변수, 아이 동반 팁을 반드시 붙이세요.
+
+# 출력 형식
+아래 JSON 객체 하나만 출력하세요. 코드블록·설명·인사말 없이 JSON만.
+각 문자열은 한 문장으로 간결하게 쓰세요.
 {
- "note":"아빠에게 건네는 따뜻한 제안 1~2문장",
+ "note":"아빠에게 건네는 이번 주말 제안 1~2문장",
+ "excluded":"검토했으나 제외한 곳과 그 이유를 1~2문장으로",
  "places":[
-  {"name":"장소명","type":"박물관","area":"지역","desc":"한 줄 소개","ageFit":"추천 연령","indoor":true,"crowd":"낮음","bestDay":"토","why":"이 가족에게 맞는 이유 한 문장"}
+  {
+   "name":"장소명","type":"박물관","area":"지역",
+   "desc":"한 줄 소개",
+   "why":"추천 이유 한 문장",
+   "vsAlt":"비슷한 대안 대비 이곳이 나은 점 한 문장",
+   "stay":"예상 체류시간 (예: 2시간)",
+   "travel":"집에서 이동시간 (예: 차 25분)",
+   "cost":"비용 (예: 어른 4천원·어린이 무료 / 무료)",
+   "booking":"예약 필요 여부 (예: 불필요 / 온라인 사전예약 필수)",
+   "hours":"운영시간·휴무일 (예: 09:30-18:00, 월요일 휴무)",
+   "weatherNote":"날씨 변수 한 문장",
+   "kidTip":"아이 동반 팁 한 문장 (유모차·주차·화장실·대기 등)",
+   "ageFit":"추천 연령",
+   "indoor":true,
+   "crowd":"낮음",
+   "bestDay":"토",
+   "warning":"주의사항이 있으면 한 문장, 없으면 빈 문자열"
+  }
  ]
 }
 crowd는 "낮음/보통/높음", bestDay는 "토/일/주말내내".`;
@@ -112,20 +153,27 @@ crowd는 "낮음/보통/높음", bestDay는 "토/일/주말내내".`;
     },
     body: JSON.stringify({
       model: "claude-sonnet-5",
-      max_tokens: 4000,
+      max_tokens: 8000,
       messages: [{ role: "user", content: prompt }],
+      tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 8 }],
     }),
   });
+
   const data = await res.json();
   if (!res.ok) throw new Error("Anthropic 오류: " + JSON.stringify(data));
-  const text = data.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+
+  const text = data.content
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+
   const s = text.indexOf("{");
   const e = text.lastIndexOf("}");
   const slice = text.slice(s, e + 1);
   try {
     return JSON.parse(slice);
   } catch {
-    // 답이 잘렸을 때: 마지막 온전한 항목까지만 살려서 복구
+    // 답이 잘렸을 때: 마지막 온전한 항목까지만 살려 복구
     const cut = slice.lastIndexOf("}", slice.lastIndexOf("}") - 1);
     return JSON.parse(slice.slice(0, cut + 1) + "]}");
   }
@@ -135,8 +183,8 @@ crowd는 "낮음/보통/높음", bestDay는 "토/일/주말내내".`;
 function typeMeta(t = "") {
   if (/박물관|미술|전시|과학관/.test(t)) return { c: "#7C56A6", bg: "#ECE2F5", icon: "🏛️" };
   if (/체험|공방|만들기|농장|목장/.test(t)) return { c: "#DD8A2E", bg: "#FBEAD1", icon: "🎨" };
-  if (/공원|자연|숲|수목원|산|바다|강/.test(t)) return { c: "#3F8A5D", bg: "#DFF0E5", icon: "🌳" };
-  if (/실내|키즈|놀이|카페|도서/.test(t)) return { c: "#3576B8", bg: "#E2ECF7", icon: "🧩" };
+  if (/공원|자연|숲|수목원|산|바다|강|산책/.test(t)) return { c: "#3F8A5D", bg: "#DFF0E5", icon: "🌳" };
+  if (/실내|키즈|놀이|카페|도서|맛집|식당/.test(t)) return { c: "#3576B8", bg: "#E2ECF7", icon: "🧩" };
   return { c: "#5A6479", bg: "#EEF1F5", icon: "📍" };
 }
 function crowdMeta(l = "") {
@@ -147,8 +195,8 @@ function crowdMeta(l = "") {
 const esc = (s = "") =>
   String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
-// ── HTML 페이지 렌더 ──
-function renderPage({ weather, note, places, satLabel, sunLabel, updated }) {
+// ── HTML 렌더 ──
+function renderPage({ weather, note, excluded, places, satLabel, sunLabel, updated }) {
   const wCard = (day, date, w) =>
     w
       ? `<div class="wc"><div class="wc-top"><b>${day}</b><span>${date}</span></div>
@@ -156,6 +204,9 @@ function renderPage({ weather, note, places, satLabel, sunLabel, updated }) {
          <div class="wc-temp"><span class="hi">${w.high}°</span><span class="lo">${w.low}°</span></div>
          <div class="wc-rain">☔ ${w.rain}%</div></div>`
       : `<div class="wc"><div class="wc-top"><b>${day}</b><span>${date}</span></div><div class="wc-emoji">🌤️</div><div class="wc-cond">정보 없음</div></div>`;
+
+  const row = (label, val) =>
+    val ? `<div class="row"><span class="rl">${label}</span><span class="rv">${esc(val)}</span></div>` : "";
 
   const cards = (places || [])
     .map((p) => {
@@ -168,6 +219,17 @@ function renderPage({ weather, note, places, satLabel, sunLabel, updated }) {
         </div>
         <p class="p-desc">${esc(p.desc)}</p>
         ${p.why ? `<p class="p-why">💡 ${esc(p.why)}</p>` : ""}
+        ${p.vsAlt ? `<p class="p-alt">⚖️ ${esc(p.vsAlt)}</p>` : ""}
+        <div class="info">
+          ${row("체류", p.stay)}
+          ${row("이동", p.travel)}
+          ${row("비용", p.cost)}
+          ${row("예약", p.booking)}
+          ${row("운영", p.hours)}
+          ${row("날씨", p.weatherNote)}
+        </div>
+        ${p.kidTip ? `<p class="p-kid">👶 ${esc(p.kidTip)}</p>` : ""}
+        ${p.warning ? `<p class="p-warn">⚠️ ${esc(p.warning)}</p>` : ""}
         <div class="tags">
           <span class="tag" style="background:${t.bg};color:${t.c}">${esc(p.type)}</span>
           <span class="tag" style="background:${cr.bg};color:${cr.c}">${cr.label}</span>
@@ -185,7 +247,7 @@ function renderPage({ weather, note, places, satLabel, sunLabel, updated }) {
 @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable.min.css');
 *{box-sizing:border-box}
 body{margin:0;background:#EDF1F6;font-family:'Pretendard Variable',-apple-system,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;color:#20293A;-webkit-font-smoothing:antialiased}
-.wrap{max-width:560px;margin:0 auto;padding:22px 16px 44px}
+.wrap{max-width:580px;margin:0 auto;padding:22px 16px 44px}
 .head{display:flex;align-items:center;gap:12px;margin-bottom:18px}
 .mark{width:44px;height:44px;border-radius:14px;display:grid;place-items:center;font-size:22px;color:#fff;background:linear-gradient(140deg,#F2A94E,#DD8A2E);box-shadow:0 6px 16px rgba(221,138,46,.3)}
 h1{font-size:20px;font-weight:800;margin:0;letter-spacing:-.02em}
@@ -214,11 +276,18 @@ body.hidecrowd .place[data-crowd="높음"]{display:none}
 .p-area{font-size:12px;color:#5A6479}
 .p-best{flex:none;font-size:11px;font-weight:800;color:#DD8A2E;background:#FBEAD1;padding:4px 9px;border-radius:20px}
 .p-desc{margin:10px 0 0;font-size:13.5px;line-height:1.55;color:#3A4256}
-.p-why{margin:8px 0 0;font-size:13px;line-height:1.5;color:#5A6479}
+.p-why,.p-alt,.p-kid{margin:7px 0 0;font-size:12.8px;line-height:1.5;color:#5A6479}
+.p-warn{margin:7px 0 0;font-size:12.8px;line-height:1.5;color:#C1503F;font-weight:600}
+.info{margin-top:11px;border-top:1px dashed #DEE5EC;padding-top:9px;display:flex;flex-direction:column;gap:5px}
+.row{display:flex;gap:10px;font-size:12.5px;line-height:1.45}
+.rl{flex:none;width:34px;color:#8A93A5;font-weight:700}
+.rv{color:#3A4256}
 .tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
 .tag{font-size:11.5px;font-weight:700;padding:4px 10px;border-radius:8px}
 .tag.plain{background:#EDF1F6;color:#5A6479}
-.foot{text-align:center;font-size:11.5px;color:#5A6479;margin-top:22px}
+.excl{margin-top:14px;background:#fff;border:1px solid #DEE5EC;border-radius:14px;padding:13px 15px;font-size:12.5px;line-height:1.55;color:#5A6479}
+.excl b{color:#20293A;display:block;margin-bottom:4px;font-size:12.5px}
+.foot{text-align:center;font-size:11.5px;color:#5A6479;margin-top:20px;line-height:1.6}
 </style></head><body>
 <div class="wrap">
   <div class="head">
@@ -232,7 +301,8 @@ body.hidecrowd .place[data-crowd="높음"]{display:none}
     <label class="toggle"><input type="checkbox" id="hc">붐비는 곳 숨기기</label>
   </div>
   <div class="places">${cards}</div>
-  <p class="foot">${updated} 업데이트 · 날씨 Open-Meteo</p>
+  ${excluded ? `<div class="excl"><b>검토했지만 뺀 곳</b>${esc(excluded)}</div>` : ""}
+  <p class="foot">${updated} 업데이트 · 날씨 Open-Meteo<br>운영시간·비용은 방문 전 한 번 더 확인하세요.</p>
 </div>
 <script>
   document.getElementById('hc').addEventListener('change',function(e){
@@ -256,18 +326,23 @@ async function sendTelegram(text) {
 try {
   const { satLabel, sunLabel } = weekendDates();
   const weather = await getWeather();
-  const { note, places } = await getPlaces(weather);
+  const { note, excluded, places } = await getPlaces(weather);
   const updated = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
 
-  const html = renderPage({ weather, note, places, satLabel, sunLabel, updated });
+  const html = renderPage({ weather, note, excluded, places, satLabel, sunLabel, updated });
   await mkdir("public", { recursive: true });
   await writeFile("public/index.html", html, "utf-8");
 
   const w = (x) => (x ? `${x.emoji} ${x.condition} ${x.high}°/${x.low}°` : "-");
+  const top = (places || [])
+    .slice(0, 3)
+    .map((p, i) => `${i + 1}. ${p.name} (${p.travel || ""})`)
+    .join("\n");
   const msg =
     `☀️ 이번 주말 나들이 추천 (${satLabel}~${sunLabel})\n\n` +
     `토: ${w(weather.sat)}\n일: ${w(weather.sun)}\n\n` +
-    `아이들 데려갈 곳 ${(places || []).length}곳 골라놨어요 👇\n${SITE_URL}`;
+    `${top}\n\n` +
+    `체류시간·비용·예약·아이팁까지 정리해놨어요 👇\n${SITE_URL}`;
   await sendTelegram(msg);
 
   console.log("✅ 페이지 생성 + 텔레그램 발송 완료");
