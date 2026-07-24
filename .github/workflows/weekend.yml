@@ -1,10 +1,9 @@
 # .github/workflows/weekend.yml
-# 저장소 안에서 반드시 .github/workflows/ 폴더에 두세요.
 name: weekend
 
 on:
   schedule:
-    - cron: "0 0 * * 3" # 매주 수요일 09:00 KST (00:00 UTC)
+    - cron: "0 0 * * 3" # 매주 수요일 08:00 KST (00:00 UTC)
   workflow_dispatch: {} # Actions 탭에서 수동 실행(테스트)용
 
 permissions:
@@ -22,30 +21,38 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      # ▼▼ 여기 값들만 본인에 맞게 수정하세요 ▼▼
+      SITE_URL: "https://kjhoper8203-art.github.io/weekend-dad/"
+      BOT_NAME: "주말 참모"
+      KIDS_AGES: "4, 6"
+      LOCATION: "안양"
+      MUSEUM_RATIO: "60"
+      MAX_TRAVEL: "80"      # 편도 최대 이동시간(분)
+      PLACE_COUNT: "5"      # 추천 개수
+      KEEP_WEEKS: "4"       # 최근 몇 주간 같은 곳 제외할지
+      # ▲▲ 여기까지 ▲▲
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Generate page & send Telegram
+      # 1) 추천 생성 + 페이지 만들기 (아직 톡은 안 보냄)
+      - name: Generate page
         run: node generate.mjs
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # ▼▼ 여기 3줄은 정현님 환경에 맞게 수정하세요 ▼▼
-          SITE_URL: "https://kjhoper8203-art.github.io/weekend-dad/"
-          KIDS_AGES: "4, 6"
-          BOT_NAME: "주말 작전참모"
-          KEEP_WEEKS: "8"
-          MAX_TRAVEL: "60"
-          LOCATION: "안양"
-          MUSEUM_RATIO: "50"
 
       - uses: actions/upload-pages-artifact@v3
         with:
           path: ./public
 
+      # 2) 페이지를 인터넷에 올리기
       - id: deploy
         uses: actions/deploy-pages@v4
+
+      # 3) 배포가 끝난 뒤에야 톡 발송
+      - name: Send Telegram
+        run: node generate.mjs send
