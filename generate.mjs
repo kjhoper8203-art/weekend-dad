@@ -18,6 +18,8 @@ const RATIO = process.env.MUSEUM_RATIO || "60";
 const MAX_TRAVEL = process.env.MAX_TRAVEL || "60";
 const KEEP_WEEKS = Number(process.env.KEEP_WEEKS || 8);
 const MODEL = process.env.MODEL || "claude-sonnet-5";
+const PLACE_COUNT = Number(process.env.PLACE_COUNT || 5);   // 목표 추천 수
+const MIN_PLACES = Number(process.env.MIN_PLACES || 4);     // 이보다 적으면 재시도
 
 // ── 이번 주말 날짜 (KST) ──
 function weekendDates() {
@@ -142,7 +144,10 @@ function extractJson(text) {
   for (let k = body.length; k > 0; k--) {
     if (body[k - 1] !== "}") continue;
     for (const s of ["", "}", "]}", "}]}", '"}]}', '""}]}']) {
-      try { const o = JSON.parse(body.slice(0, k) + s); if (o && Array.isArray(o.places)) return o; } catch {}
+      try {
+        const o = JSON.parse(body.slice(0, k) + s);
+        if (o && Array.isArray(o.places)) { o.__repaired = true; return o; }
+      } catch {}
     }
   }
   throw new Error("JSON 형식 복구 실패");
@@ -165,13 +170,13 @@ async function research(weather, avoid) {
 - 날씨: 토(${satLabel}) ${wLine(weather.sat)} / 일(${sunLabel}) ${wLine(weather.sun)}${avoidLine}
 
 web_search로 다음을 조사하세요.
-1) 후보 8~10곳 (박물관·체험·자연·실내놀이·사진명소 등 범주를 섞어서)
+1) 후보 10~12곳 (박물관·체험·자연·실내놀이·사진명소 등 범주를 섞어서)
 2) 각 후보의 운영시간, 휴무일, 예약 필요 여부, 입장료, 주차, 아이 동반 편의성, 최근 붐빔·웨이팅 경향
 3) 이동시간 대비 만족도가 낮거나, 붐비거나, 아이가 힘들거나, 운영이 불확실해 제외할 곳
 
 조사 결과를 항목별로 정리해 알려주세요. 형식은 자유롭게, 사실 위주로 간결하게 쓰세요.`;
 
-  const { text } = await callClaude({ prompt, maxTokens: 4000, useSearch: true });
+  const { text } = await callClaude({ prompt, maxTokens: 6000, useSearch: true });
   return text;
 }
 
@@ -186,7 +191,8 @@ async function toJson(notes, weather, avoid) {
 ${notes}
 =====================
 
-이 중에서 조건에 가장 맞는 최종 5곳을 골라 JSON으로만 정리하세요.
+이 중에서 조건에 가장 맞는 최종 ${PLACE_COUNT}곳을 골라 JSON으로만 정리하세요.
+- 반드시 ${PLACE_COUNT}개 항목을 모두 채우세요. 개수가 부족하면 안 됩니다.
 - 아이 ${AGES}세 / 편도 ${MAX_TRAVEL}분 이내 / 박물관·체험 약 ${RATIO}% 비중
 - 붐비는 곳, 웨이팅 긴 곳, 운영 불확실한 곳, 비슷한 유형 중복은 제외
 - 토(${satLabel}) / 일(${sunLabel}) 날씨를 반영해 bestDay를 정할 것${avoidLine}
@@ -200,19 +206,24 @@ ${notes}
 
 crowd는 "낮음/보통/높음", bestDay는 "토/일/주말내내".`;
 
-  let lastText = "", lastStop = "";
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const { text, stop } = await callClaude({ prompt, maxTokens: 4000, useSearch: false });
+  let lastText = "", lastStop = "", best = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const { text, stop } = await callClaude({ prompt, maxTokens: 8000, useSearch: false });
     lastText = text; lastStop = stop;
     try {
       const r = extractJson(text);
-      if (Array.isArray(r.places) && r.places.length) return r;
-      console.log(`⚠️ ${attempt}차 시도: 장소 목록이 비어 재시도합니다.`);
+      const n = Array.isArray(r.places) ? r.places.length : 0;
+      console.log(`   ${attempt}차 시도: ${n}곳 파싱${r.__repaired ? " (잘림 복구됨)" : ""}${stop === "max_tokens" ? " [응답 길이 한도 도달]" : ""}`);
+      if (n && (!best || n > best.places.length)) best = r;
+      if (n >= MIN_PLACES) return r;
     } catch (e) {
-      console.log(`⚠️ ${attempt}차 시도 실패(${e.message}) — 재시도합니다.`);
+      console.log(`   ${attempt}차 시도 실패: ${e.message}`);
     }
   }
-  // 진단 로그
+  if (best && best.places.length) {
+    console.log(`⚠️ ${MIN_PLACES}곳을 못 채워 ${best.places.length}곳으로 진행합니다.`);
+    return best;
+  }
   console.log("── 진단 정보 ──");
   console.log("stop_reason:", lastStop);
   console.log("응답 길이:", lastText.length);
@@ -381,7 +392,9 @@ try {
   console.log(`ℹ️ 1단계 조사 완료 (${notes.length}자)`);
 
   const result = await toJson(notes, weather, avoid);
+  const parsed = (result.places || []).length;
   const places = (result.places || []).filter((p) => p && p.name && !avoid.includes(p.name));
+  if (parsed !== places.length) console.log(`ℹ️ 최근 방문지와 겹쳐 ${parsed - places.length}곳 제외`);
   if (!places.length) throw new Error("최종 추천이 비어 있습니다. 다시 실행해보세요.");
   console.log(`ℹ️ 2단계 정리 완료 (${places.length}곳)`);
 
