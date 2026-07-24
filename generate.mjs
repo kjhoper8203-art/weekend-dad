@@ -1,9 +1,10 @@
-// generate.mjs  (v3 — JSON 추출 안정화판)
+// generate.mjs  (v4 — 방문 이력 반영 + 봇 이름 설정화)
 // 매주 수요일 GitHub Actions가 실행합니다.
-//  1) 이번 주말 날씨 (Open-Meteo, 무료·키 불필요)
-//  2) Claude + 웹검색으로 후보수집 → 평가 → 제외 → 최종선별
-//  3) 상세 페이지(public/index.html) 생성
-//  4) 텔레그램으로 링크 발송
+//  1) 지난 8주 추천 이력 불러오기 (중복 방지)
+//  2) 이번 주말 날씨 (Open-Meteo, 무료·키 불필요)
+//  3) Claude + 웹검색으로 후보수집 → 평가 → 제외 → 최종선별
+//  4) 상세 페이지(public/index.html) + 이력(public/history.json) 생성
+//  5) 텔레그램으로 링크 발송
 // Node 20+ (설치 패키지 없음)
 
 import { writeFile, mkdir } from "node:fs/promises";
@@ -11,13 +12,15 @@ import { writeFile, mkdir } from "node:fs/promises";
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const SITE_URL = process.env.SITE_URL || "";
+const SITE_URL = (process.env.SITE_URL || "").replace(/\/?$/, "/");
 
-// ── 가족 설정 ──
+// ── 설정 ──
+const BOT_NAME = process.env.BOT_NAME || "주말 참모";
 const AGES = process.env.KIDS_AGES || "5, 7";
 const LOCATION = process.env.LOCATION || "안양";
 const RATIO = process.env.MUSEUM_RATIO || "60";
 const MAX_TRAVEL = process.env.MAX_TRAVEL || "60"; // 편도 최대 이동시간(분)
+const KEEP_WEEKS = Number(process.env.KEEP_WEEKS || 8); // 이력 보관 주수(= 재추천 금지 기간)
 
 // ── 이번 주말(다가오는 토/일) 날짜 (KST) ──
 function weekendDates() {
@@ -31,6 +34,27 @@ function weekendDates() {
     `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
   const label = (d) => `${d.getUTCMonth() + 1}월 ${d.getUTCDate()}일`;
   return { satISO: iso(sat), sunISO: iso(sun), satLabel: label(sat), sunLabel: label(sun) };
+}
+
+// ── 지난 추천 이력 (published 페이지에서 읽어옴) ──
+async function loadHistory() {
+  if (!SITE_URL || SITE_URL === "/") return { weeks: [] };
+  try {
+    const res = await fetch(`${SITE_URL}history.json?t=${Date.now()}`);
+    if (!res.ok) return { weeks: [] };
+    const j = await res.json();
+    return Array.isArray(j?.weeks) ? j : { weeks: [] };
+  } catch {
+    return { weeks: [] }; // 첫 실행 등
+  }
+}
+function recentNames(hist) {
+  const seen = [];
+  for (const w of hist.weeks || []) for (const n of w.places || []) if (!seen.includes(n)) seen.push(n);
+  return seen;
+}
+function mergeHistory(prev, entry) {
+  return { weeks: [entry, ...(prev.weeks || [])].slice(0, KEEP_WEEKS) };
 }
 
 // ── WMO 날씨 코드 → 이모지/한글 ──
@@ -81,8 +105,6 @@ async function getWeather() {
 // ── 답변에서 JSON만 안전하게 추출 (검색 멘트 섞임 / 중간 잘림 대응) ──
 function extractJson(text) {
   const clean = text.replace(/```json/gi, "").replace(/```/g, "");
-
-  // 1) 균형 잡힌 { ... } 후보를 모두 찾아 파싱 (places 포함된 것 우선)
   const candidates = [];
   for (let i = 0; i < clean.length; i++) {
     if (clean[i] !== "{") continue;
@@ -107,8 +129,6 @@ function extractJson(text) {
     if (!c.includes('"places"')) continue;
     try { return JSON.parse(c); } catch {}
   }
-
-  // 2) 잘린 경우: 마지막 온전한 항목까지만 살려 복구
   const start = clean.lastIndexOf('{"note"') !== -1 ? clean.lastIndexOf('{"note"') : clean.indexOf("{");
   if (start === -1) throw new Error("추천 결과에서 JSON을 찾지 못했습니다.");
   const body = clean.slice(start);
@@ -126,13 +146,16 @@ function extractJson(text) {
   throw new Error("추천 결과 형식이 올바르지 않습니다.");
 }
 
-// ── Claude 추천 (후보수집 → 평가 → 제외 → 최종선별) ──
-async function getPlaces(weather) {
+// ── Claude 추천 ──
+async function getPlaces(weather, avoid) {
   const { satLabel, sunLabel } = weekendDates();
   const wLine = (w) => (w ? `${w.condition} ${w.high}°/${w.low}°, 강수확률 ${w.rain}%` : "정보 없음");
+  const avoidBlock = avoid.length
+    ? `\n# 0단계) 최근 방문지 제외 (최우선)\n아래는 최근 ${KEEP_WEEKS}주 안에 이미 추천한 곳입니다. 절대 다시 추천하지 마세요.\n${avoid.join(" / ")}\n또한 위 목록과 유형·성격이 거의 같은 곳(예: 같은 종류의 시설이 이미 있으면 다른 유형으로)은 피하고, 지난주와 다른 방향·동선으로 새로움을 주세요.\n`
+    : "";
 
   const prompt = `당신은 가족 나들이 플래너입니다. 아래 절차를 순서대로 수행하세요.
-
+${avoidBlock}
 # 기본 조건
 - 기준 위치(집): ${LOCATION}
 - 아이 나이: ${AGES}세
@@ -143,7 +166,7 @@ async function getPlaces(weather) {
 - 성향: 박물관·전시·체험 선호(약 ${RATIO}%), 나머지는 자연·산책·실내놀이 등으로 배분. 사람이 많고 복잡한 곳 기피.
 
 # 1단계) 후보 수집
-web_search로 다음 범주에서 후보를 폭넓게 수집하세요.
+web_search로 다음 범주에서 후보를 폭넓게 수집하세요. 잘 알려진 곳만이 아니라 덜 알려진 곳도 포함하세요.
 대표 관광지 / 아이와 가기 좋은 곳 / 자연·산책 / 실내·우천 대체 / 맛집 / 카페 / 특별 체험 / 사진 명소
 
 # 2단계) 후보 평가
@@ -152,7 +175,7 @@ web_search로 다음 범주에서 후보를 폭넓게 수집하세요.
 
 # 3단계) 제외
 아래는 원칙적으로 제외하세요(부득이 포함 시 warning에 경고를 적을 것).
-이동시간 대비 만족도가 낮은 곳 / 과도하게 붐비거나 웨이팅이 긴 곳 / ${AGES}세 아이가 힘든 곳 / 운영 여부가 불확실한 곳 / 이미 비슷한 유형이 포함된 경우 / 동선에서 크게 벗어난 곳 / 안전상 주의가 필요한 곳
+최근 방문지(0단계 목록) / 이동시간 대비 만족도가 낮은 곳 / 과도하게 붐비거나 웨이팅이 긴 곳 / ${AGES}세 아이가 힘든 곳 / 운영 여부가 불확실한 곳 / 이미 비슷한 유형이 포함된 경우 / 동선에서 크게 벗어난 곳 / 안전상 주의가 필요한 곳
 
 # 4단계) 최종 선별
 최종 5곳만 남기고, 각 장소에 추천 이유·대안과의 차이·체류시간·이동시간·비용·예약 여부·날씨 변수·아이 동반 팁을 붙이세요.
@@ -181,14 +204,17 @@ crowd는 "낮음/보통/높음", bestDay는 "토/일/주말내내".`;
   const data = await res.json();
   if (!res.ok) throw new Error("Anthropic 오류: " + JSON.stringify(data));
 
-  const text = data.content
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
-    .join("\n");
-
+  const text = data.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
   const result = extractJson(text);
   if (!Array.isArray(result.places) || result.places.length === 0) {
     throw new Error("추천 장소가 비어 있습니다. 다시 실행해보세요.");
+  }
+  // 혹시 이력과 겹치면 최종 안전망으로 한 번 더 걸러냄
+  const before = result.places.length;
+  result.places = result.places.filter((p) => !avoid.includes(p.name));
+  if (result.places.length === 0) result.places = [];
+  if (before !== result.places.length) {
+    console.log(`ℹ️ 최근 방문지와 겹친 ${before - result.places.length}곳 제외됨`);
   }
   return result;
 }
@@ -210,7 +236,7 @@ const esc = (s = "") =>
   String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 // ── HTML 렌더 ──
-function renderPage({ weather, note, excluded, places, satLabel, sunLabel, updated }) {
+function renderPage({ weather, note, excluded, places, satLabel, sunLabel, updated, history }) {
   const wCard = (day, date, w) =>
     w
       ? `<div class="wc"><div class="wc-top"><b>${day}</b><span>${date}</span></div>
@@ -254,9 +280,16 @@ function renderPage({ weather, note, excluded, places, satLabel, sunLabel, updat
     })
     .join("");
 
+  const pastWeeks = (history?.weeks || []).slice(1, 5); // 이번 주 제외한 최근 4주
+  const pastBlock = pastWeeks.length
+    ? `<div class="past"><b>최근에 추천했던 곳 (당분간 제외)</b>${pastWeeks
+        .map((w) => `<div class="pw"><span>${esc(w.date)}</span> ${esc((w.places || []).join(", "))}</div>`)
+        .join("")}</div>`
+    : "";
+
   return `<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>주말 우수 남편 봇</title>
+<title>${esc(BOT_NAME)}</title>
 <style>
 @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable.min.css');
 *{box-sizing:border-box}
@@ -299,16 +332,18 @@ body.hidecrowd .place[data-crowd="높음"]{display:none}
 .tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
 .tag{font-size:11.5px;font-weight:700;padding:4px 10px;border-radius:8px}
 .tag.plain{background:#EDF1F6;color:#5A6479}
-.excl{margin-top:14px;background:#fff;border:1px solid #DEE5EC;border-radius:14px;padding:13px 15px;font-size:12.5px;line-height:1.55;color:#5A6479}
-.excl b{color:#20293A;display:block;margin-bottom:4px;font-size:12.5px}
+.excl,.past{margin-top:14px;background:#fff;border:1px solid #DEE5EC;border-radius:14px;padding:13px 15px;font-size:12.5px;line-height:1.55;color:#5A6479}
+.excl b,.past b{color:#20293A;display:block;margin-bottom:6px;font-size:12.5px}
+.pw{margin-top:3px}
+.pw span{color:#8A93A5;font-weight:700;margin-right:6px}
 .foot{text-align:center;font-size:11.5px;color:#5A6479;margin-top:20px;line-height:1.6}
 </style></head><body>
 <div class="wrap">
   <div class="head">
     <div class="mark">☀︎</div>
-    <div><h1>주말 우수 남편 봇</h1><p class="sub">${satLabel}(토)·${sunLabel}(일) 나들이 추천</p></div>
+    <div><h1>${esc(BOT_NAME)}</h1><p class="sub">${satLabel}(토)·${sunLabel}(일) 나들이 추천</p></div>
   </div>
-  ${note ? `<div class="note"><span class="badge">우수 남편 봇</span><p>${esc(note)}</p></div>` : ""}
+  ${note ? `<div class="note"><span class="badge">${esc(BOT_NAME)}</span><p>${esc(note)}</p></div>` : ""}
   <div class="weather">${wCard("토", satLabel, weather.sat)}${wCard("일", sunLabel, weather.sun)}</div>
   <div class="bar">
     <span class="cnt">추천 ${(places || []).length}곳</span>
@@ -316,6 +351,7 @@ body.hidecrowd .place[data-crowd="높음"]{display:none}
   </div>
   <div class="places">${cards}</div>
   ${excluded ? `<div class="excl"><b>검토했지만 뺀 곳</b>${esc(excluded)}</div>` : ""}
+  ${pastBlock}
   <p class="foot">${updated} 업데이트 · 날씨 Open-Meteo<br>운영시간·비용은 방문 전 한 번 더 확인하세요.</p>
 </div>
 <script>
@@ -339,13 +375,21 @@ async function sendTelegram(text) {
 // ── 실행 ──
 try {
   const { satLabel, sunLabel } = weekendDates();
+
+  const prevHistory = await loadHistory();
+  const avoid = recentNames(prevHistory);
+  console.log(`ℹ️ 최근 ${KEEP_WEEKS}주 제외 대상 ${avoid.length}곳`);
+
   const weather = await getWeather();
-  const { note, excluded, places } = await getPlaces(weather);
+  const { note, excluded, places } = await getPlaces(weather, avoid);
   const updated = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
 
-  const html = renderPage({ weather, note, excluded, places, satLabel, sunLabel, updated });
+  const history = mergeHistory(prevHistory, { date: updated, places: places.map((p) => p.name) });
+
+  const html = renderPage({ weather, note, excluded, places, satLabel, sunLabel, updated, history });
   await mkdir("public", { recursive: true });
   await writeFile("public/index.html", html, "utf-8");
+  await writeFile("public/history.json", JSON.stringify(history, null, 2), "utf-8");
 
   const w = (x) => (x ? `${x.emoji} ${x.condition} ${x.high}°/${x.low}°` : "-");
   const top = places
@@ -359,7 +403,7 @@ try {
     `체류시간·비용·예약·아이팁까지 정리해놨어요 👇\n${SITE_URL}`;
   await sendTelegram(msg);
 
-  console.log(`✅ 완료 — 추천 ${places.length}곳, 텔레그램 발송됨`);
+  console.log(`✅ 완료 — 추천 ${places.length}곳, 이력 ${history.weeks.length}주 보관, 텔레그램 발송됨`);
 } catch (e) {
   console.error("❌ 실패:", e.message);
   process.exit(1);
